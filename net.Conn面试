@@ -1,0 +1,964 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+)
+
+const (
+	TypeLen    int = 1
+	RandKeyLen int = 24
+	KeyLenLen  int = 4
+	DataLenLen int = 4
+)
+
+var ConnHaveCloseErr = errors.New("连接已经关闭")
+
+var atomicInt atomic.Uint64
+
+type MessageType uint8
+
+const (
+	Connect MessageType = 1
+	Msg     MessageType = 2
+	Close   MessageType = 3
+)
+
+type Message struct {
+	RandKey string
+	Key     string
+	Data    []byte
+	Type    MessageType
+	done    chan error
+}
+
+type WriteCloser struct {
+	conn      *Conn
+	key       string
+	randKey   string
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeDo   sync.Once
+	finishDo  sync.Once
+	finishErr error
+}
+
+func NewWriteCloser(key string, conn *Conn) *WriteCloser {
+	randKey := fmt.Sprintf("%24s", fmt.Sprintf("%s%s", newRandomKey(), key)) // 固定长度24
+	w := &WriteCloser{
+		conn:    conn,
+		key:     key,
+		randKey: randKey,
+	}
+	w.ctx, w.cancel = context.WithCancel(context.Background())
+	return w
+}
+
+func (w *WriteCloser) finish() error {
+	w.finishDo.Do(func() {
+		w.finishErr = w.conn.sendConnect(w.randKey, w.key)
+	})
+	return w.finishErr
+}
+
+func (w *WriteCloser) Write(p []byte) (n int, err error) {
+	err = w.conn.send(w.ctx, w.randKey, w.key, p)
+	if err == nil {
+		n = len(p)
+	}
+	return
+}
+
+func (w *WriteCloser) Close() error {
+	w.closeDo.Do(func() {
+		w.cancel()
+		w.conn.closeWriter(w.key)
+	})
+	return nil
+}
+
+type Reader struct {
+	randKey string
+	key     string
+	data    []byte
+	rWMutex sync.RWMutex
+	dataQ   Queue[[]byte]
+}
+
+func NewReader(randKey, key string) *Reader {
+	r := &Reader{
+		randKey: randKey,
+		key:     key,
+		data:    make([]byte, 0, 1024),
+		dataQ:   NewNQueue[[]byte](),
+	}
+	return r
+}
+
+func (r *Reader) Read(p []byte) (n int, err error) {
+	r.rWMutex.Lock()
+	dataLen := len(r.data)
+	if dataLen > 0 {
+		if dataLen > len(p) {
+			n = copy(p, r.data[:len(p)])
+			r.data = r.data[len(p):]
+			r.rWMutex.Unlock()
+			return
+		} else {
+			n = copy(p, r.data)
+			r.data = r.data[:0]
+			r.rWMutex.Unlock()
+			return
+		}
+	}
+	r.rWMutex.Unlock()
+
+	for {
+		if value, ok, isClose := r.dataQ.DequeueWait(); ok {
+
+			r.data = append(r.data, value...)
+			r.rWMutex.Lock()
+			dataLen := len(r.data)
+			if dataLen > 0 {
+				if dataLen > len(p) {
+					n = copy(p, r.data[:len(p)])
+					r.data = r.data[len(p):]
+					r.rWMutex.Unlock()
+					return
+				} else {
+					n = copy(p, r.data)
+					r.data = r.data[:0]
+					r.rWMutex.Unlock()
+					return
+				}
+			}
+			r.rWMutex.Unlock()
+		} else if isClose {
+			return 0, io.EOF
+		}
+	}
+}
+
+func (r *Reader) write(p []byte) (err error) {
+	return r.dataQ.Enqueue(p)
+}
+
+func (r *Reader) Close() error {
+	r.dataQ.Close()
+	return nil
+}
+
+// Conn 是你需要实现的一种连接类型，它支持下面描述的若干接口；
+// 为了实现这些接口，你需要设计一个基于 TCP 的简单协议；
+type Conn struct {
+	c              net.Conn
+	closeDo        sync.Once
+	msgChan        chan *Message
+	ctx            context.Context
+	cancel         context.CancelFunc
+	rWMutex        sync.RWMutex
+	writeCloserMap map[string]*WriteCloser
+
+	rMutex    sync.RWMutex
+	readerMap map[string]*Reader
+	done      chan struct{}
+	readerQ   Queue[*Reader]
+}
+
+// NewConn 从一个 TCP 连接得到一个你实现的连接对象
+func NewConn(c net.Conn) *Conn {
+	conn := &Conn{
+		c:              c,
+		msgChan:        make(chan *Message),
+		writeCloserMap: make(map[string]*WriteCloser),
+		readerMap:      make(map[string]*Reader),
+		readerQ:        NewNQueue[*Reader](),
+		done:           make(chan struct{}),
+	}
+	conn.ctx, conn.cancel = context.WithCancel(context.Background())
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		defer func() {
+			wg.Wait()
+			conn.readerQ.Close()
+
+			conn.rMutex.Lock()
+			for _, r := range conn.readerMap {
+				r.Close()
+			}
+			conn.readerMap = nil
+			conn.rMutex.Unlock()
+
+			close(conn.done)
+		}()
+		go func() {
+			defer wg.Done()
+			conn.handleSendMsg()
+			conn.c.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			conn.handleReadMsg()
+			conn.cancel()
+		}()
+	}()
+	return conn
+}
+
+func (conn *Conn) handleReadMsg() {
+	typeBuf := make([]byte, TypeLen)
+	randKeyBuf := make([]byte, RandKeyLen)
+	keyLenBuf := make([]byte, KeyLenLen)
+	dataLenBuf := make([]byte, DataLenLen)
+
+	for {
+
+		if _, err := io.ReadFull(conn.c, typeBuf); err != nil {
+			return
+		}
+		if _, err := io.ReadFull(conn.c, randKeyBuf); err != nil {
+			return
+		}
+
+		if _, err := io.ReadFull(conn.c, keyLenBuf); err != nil {
+			return
+		}
+
+		dec32 := binary.BigEndian.Uint32(keyLenBuf)
+
+		keyBuf := make([]byte, dec32)
+
+		if _, err := io.ReadFull(conn.c, keyBuf); err != nil {
+			return
+		}
+
+		key := string(keyBuf)
+		randKey := string(randKeyBuf)
+
+		switch MessageType(typeBuf[0]) {
+		case Connect:
+
+			r := NewReader(randKey, key)
+			conn.rMutex.Lock()
+			if conn.readerMap != nil {
+				if _, ok := conn.readerMap[randKey]; ok {
+					conn.rMutex.Unlock()
+					break
+				}
+				conn.readerMap[randKey] = r
+			}
+			conn.rMutex.Unlock()
+			conn.readerQ.Enqueue(r)
+
+		case Msg:
+			if _, err := io.ReadFull(conn.c, dataLenBuf); err != nil {
+				return
+			}
+
+			dec32 := binary.BigEndian.Uint32(dataLenBuf)
+			dataBuf := make([]byte, dec32)
+			if _, err := io.ReadFull(conn.c, dataBuf); err != nil {
+				return
+			}
+
+			var r *Reader
+			conn.rMutex.RLock()
+			if conn.readerMap != nil {
+				r = conn.readerMap[randKey]
+			}
+			conn.rMutex.RUnlock()
+
+			if r != nil {
+				r.write(dataBuf)
+			}
+		case Close:
+
+			var r *Reader
+			conn.rMutex.Lock()
+			if conn.readerMap != nil {
+				r = conn.readerMap[randKey]
+				delete(conn.readerMap, randKey)
+			}
+			conn.rMutex.Unlock()
+			if r != nil {
+				r.Close()
+			}
+		default:
+
+			return
+		}
+
+	}
+}
+
+func (conn *Conn) handleSendMsg() {
+	for {
+		select {
+		case <-conn.ctx.Done():
+			conn.c.Close()
+			return
+		case msg := <-conn.msgChan:
+
+			if msg != nil {
+				buf := make([]byte, TypeLen+RandKeyLen)
+				buf[0] = byte(msg.Type)
+				copy(buf[TypeLen:TypeLen+RandKeyLen], []byte(msg.RandKey))
+
+				b32 := make([]byte, KeyLenLen) // 长度必须匹配类型字节数
+				binary.BigEndian.PutUint32(b32, uint32(len(msg.Key)))
+
+				buf = append(buf, b32...)
+				buf = append(buf, []byte(msg.Key)...)
+
+				switch msg.Type {
+				case Connect:
+					dataLen := len(buf)
+					for {
+						n, err := conn.c.Write(buf)
+						if err != nil {
+							msg.done <- err
+							continue
+						}
+						dataLen -= n
+						if dataLen == 0 {
+							break
+						}
+					}
+					msg.done <- nil
+
+				case Msg:
+					b32 := make([]byte, DataLenLen) // 长度必须匹配类型字节数
+					binary.BigEndian.PutUint32(b32, uint32(len(msg.Data)))
+					buf = append(buf, b32...)
+					buf = append(buf, msg.Data...)
+
+					dataLen := len(buf)
+					for {
+						n, err := conn.c.Write(buf)
+						if err != nil {
+							msg.done <- err
+							continue
+						}
+						dataLen -= n
+						if dataLen == 0 {
+							break
+						}
+					}
+					msg.done <- nil
+
+				case Close:
+					dataLen := len(buf)
+					for {
+						n, err := conn.c.Write(buf)
+						if err != nil {
+							msg.done <- err
+							continue
+						}
+						dataLen -= n
+						if dataLen == 0 {
+							break
+						}
+					}
+					msg.done <- nil
+				default:
+					msg.done <- nil
+					return
+				}
+			}
+		}
+	}
+}
+
+func (conn *Conn) closeWriter(key string) {
+	conn.rWMutex.Lock()
+	w := conn.writeCloserMap[key]
+	delete(conn.writeCloserMap, key)
+	conn.rWMutex.Unlock()
+	m := &Message{
+		RandKey: w.randKey,
+		Key:     w.key,
+		Type:    Close,
+		done:    make(chan error),
+	}
+	select {
+	case <-conn.ctx.Done():
+		return
+	case conn.msgChan <- m:
+		<-m.done
+	}
+	return
+}
+
+func (conn *Conn) send(ctx context.Context, randKey, key string, data []byte) (err error) {
+	m := &Message{
+		RandKey: randKey,
+		Key:     key,
+		Data:    data,
+		Type:    Msg,
+		done:    make(chan error),
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-conn.ctx.Done():
+		return conn.ctx.Err()
+	case conn.msgChan <- m:
+		err = <-m.done
+	}
+	return
+}
+
+func (conn *Conn) sendConnect(randKey, key string) (err error) {
+	m := &Message{
+		RandKey: randKey,
+		Key:     key,
+		Type:    Connect,
+		done:    make(chan error),
+	}
+	select {
+	case <-conn.ctx.Done():
+		return conn.ctx.Err()
+	case conn.msgChan <- m:
+		err = <-m.done
+	}
+	return
+}
+
+// Send 传入一个 key 表示发送者将要传输的数据对应的标识；
+// 返回 writer 可供发送者分多次写入大量该 key 对应的数据；
+// 当发送者已将该 key 对应的所有数据写入后，调用 writer.Close 告知接收者：该 key 的数据已经完全写入；
+func (conn *Conn) Send(key string) (writer io.WriteCloser, err error) {
+	conn.rWMutex.Lock()
+	var w *WriteCloser = nil
+	if ww, ok := conn.writeCloserMap[key]; ok {
+		w = ww
+	} else {
+		w = NewWriteCloser(key, conn)
+		conn.writeCloserMap[key] = w
+	}
+	conn.rWMutex.Unlock()
+
+	err = w.finish()
+	if err != nil {
+		w.Close()
+		conn.rWMutex.Lock()
+		if ww, ok := conn.writeCloserMap[key]; ok {
+			if ww == w {
+				delete(conn.writeCloserMap, key)
+			}
+			conn.rWMutex.Unlock()
+			return nil, ConnHaveCloseErr
+		}
+
+		conn.rWMutex.Unlock()
+	}
+
+	return w, nil
+}
+
+// Receive 返回一个 key 表示接收者将要接收到的数据对应的标识；
+// 返回的 reader 可供接收者多次读取该 key 对应的数据；
+// 当 reader 返回 io.EOF 错误时，表示接收者已经完整接收该 key 对应的数据；
+func (conn *Conn) Receive() (key string, reader io.Reader, err error) {
+	if value, ok, isClose := conn.readerQ.DequeueWait(); ok {
+		return value.key, value, nil
+	} else if isClose {
+		return "", nil, io.EOF
+	}
+	return "", nil, nil
+}
+
+// Close 关闭你实现的连接对象及其底层的 TCP 连接
+func (conn *Conn) Close() {
+	conn.cancel()
+	conn.readerQ.Close()
+	for range conn.done {
+		/* code */
+	}
+}
+
+// 除了上面规定的接口，你还可以自行定义新的类型，变量和函数以满足实现需求
+
+//////////////////////////////////////////////
+///////// 接下来的代码为测试代码，请勿修改 /////////
+//////////////////////////////////////////////
+
+// 连接到测试服务器，获得一个你实现的连接对象
+func dial(serverAddr string) *Conn {
+	conn, err := net.Dial("tcp", serverAddr)
+	if err != nil {
+		panic(err)
+	}
+	return NewConn(conn)
+}
+
+// 启动测试服务器
+func startServer(handle func(*Conn)) net.Listener {
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				fmt.Println("[WARNING] ln.Accept", err)
+				return
+			}
+			go handle(NewConn(conn))
+		}
+	}()
+	return ln
+}
+
+// 简单断言
+func assertEqual[T comparable](actual T, expected T) {
+	if actual != expected {
+		panic(fmt.Sprintf("actual:%v expected:%v\n", actual, expected))
+	}
+}
+
+// 简单 case：单连接，双向传输少量数据
+func testCase0() {
+	const (
+		key  = "Bible"
+		data = `Then I heard the voice of the Lord saying, “Whom shall I send? And who will go for us?”
+And I said, “Here am I. Send me!”
+Isaiah 6:8`
+	)
+	ln := startServer(func(conn *Conn) {
+		// 服务端等待客户端进行传输
+		_key, reader, err := conn.Receive()
+		if err != nil {
+			panic(err)
+		}
+		assertEqual(_key, key)
+		dataB, err := io.ReadAll(reader)
+		if err != nil {
+			panic(err)
+		}
+
+		assertEqual(string(dataB), data)
+
+		// 服务端向客户端进行传输
+		writer, err := conn.Send(key)
+		if err != nil {
+			panic(err)
+		}
+		n, err := writer.Write([]byte(data))
+		if err != nil {
+			panic(err)
+		}
+
+		if n != len(data) {
+			panic(n)
+		}
+		conn.Close()
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer ln.Close()
+
+	conn := dial(ln.Addr().String())
+	// 客户端向服务端传输
+	writer, err := conn.Send(key)
+	if err != nil {
+		panic(err)
+	}
+
+	n, err := writer.Write([]byte(data))
+
+	if n != len(data) {
+		panic(n)
+	}
+
+	err = writer.Close()
+	if err != nil {
+		panic(err)
+	}
+	// 客户端等待服务端传输
+	_key, reader, err := conn.Receive()
+	if err != nil {
+		panic(err)
+	}
+	assertEqual(_key, key)
+	dataB, err := io.ReadAll(reader)
+	if err != nil {
+		panic(err)
+	}
+
+	assertEqual(string(dataB), data)
+	fmt.Println(1111)
+	conn.Close()
+	fmt.Println(1111)
+}
+
+// 生成一个随机 key
+func newRandomKey() string {
+	buf := make([]byte, 8)
+	_, err := rand.Read(buf)
+	if err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(buf)
+}
+
+// 读取随机数据，并返回随机数据的校验和：用于验证数据是否完整传输
+func readRandomData(reader io.Reader, hash hash.Hash) (checksum string) {
+	hash.Reset()
+	buf := make([]byte, 23<<20) // 调用者读取时的 buf 大小不是固定的，你的实现中不可假定 buf 为固定值
+	for {
+		n, err := reader.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		_, err = hash.Write(buf[:n])
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	checksum = hex.EncodeToString(hash.Sum(nil))
+	return checksum
+}
+
+// 写入随机数据，并返回随机数据的校验和：用于验证数据是否完整传输
+func writeRandomData(writer io.Writer, hash hash.Hash) (checksum string) {
+	hash.Reset()
+	const (
+		dataSize = 500 << 20 // 一个 key 对应 500MB 随机二进制数据，dataSize 也可以是其他值，你的实现中不可假定 dataSize 为固定值
+		bufSize  = 1 << 20   // 调用者写入时的 buf 大小不是固定的，你的实现中不可假定 buf 为固定值
+	)
+	var (
+		buf  = make([]byte, bufSize)
+		size = 0
+	)
+	for i := 0; i < dataSize/bufSize; i++ {
+		_, err := rand.Read(buf)
+		if err != nil {
+			panic(err)
+		}
+		_, err = hash.Write(buf)
+		if err != nil {
+			panic(err)
+		}
+		n, err := writer.Write(buf)
+		if err != nil {
+			panic(err)
+		}
+		size += n
+	}
+	if size != dataSize {
+		panic(size)
+	}
+	checksum = hex.EncodeToString(hash.Sum(nil))
+	return checksum
+}
+
+// 复杂 case：多连接，双向传输，大量数据，多个不同的 key
+func testCase1() {
+	var (
+		mapKeyToChecksum = map[string]string{}
+		lock             sync.Mutex
+	)
+	ln := startServer(func(conn *Conn) {
+		// 服务端等待客户端进行传输
+		key, reader, err := conn.Receive()
+		if err != nil {
+			panic(err)
+		}
+		var (
+			h         = sha256.New()
+			_checksum = readRandomData(reader, h)
+		)
+		lock.Lock()
+		checksum, keyExist := mapKeyToChecksum[key]
+		lock.Unlock()
+		if !keyExist {
+			panic(fmt.Sprintln(key, "not exist"))
+		}
+		assertEqual(_checksum, checksum)
+
+		// 服务端向客户端连续进行 2 次传输
+		for _, key := range []string{newRandomKey(), newRandomKey()} {
+			writer, err := conn.Send(key)
+			if err != nil {
+				panic(err)
+			}
+			checksum := writeRandomData(writer, h)
+			lock.Lock()
+			mapKeyToChecksum[key] = checksum
+			lock.Unlock()
+			err = writer.Close() // 表明该 key 的所有数据已传输完毕
+			if err != nil {
+				panic(err)
+			}
+
+		}
+		conn.Close()
+	})
+	//goland:noinspection GoUnhandledErrorResult
+	defer ln.Close()
+
+	conn := dial(ln.Addr().String())
+	// 客户端向服务端传输
+	var (
+		key = newRandomKey()
+		h   = sha256.New()
+	)
+	writer, err := conn.Send(key)
+	if err != nil {
+		panic(err)
+	}
+	checksum := writeRandomData(writer, h)
+	lock.Lock()
+	mapKeyToChecksum[key] = checksum
+	lock.Unlock()
+	err = writer.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	// 客户端等待服务端的多次传输
+	keyCount := 0
+	for {
+		key, reader, err := conn.Receive()
+		if err == io.EOF {
+			// 服务端所有的数据均传输完毕，关闭连接
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		_checksum := readRandomData(reader, h)
+		lock.Lock()
+		checksum, keyExist := mapKeyToChecksum[key]
+		lock.Unlock()
+		if !keyExist {
+			panic(fmt.Sprintln(key, "not exist"))
+		}
+		assertEqual(_checksum, checksum)
+		keyCount++
+	}
+
+	assertEqual(keyCount, 2)
+	fmt.Println(2222)
+	conn.Close()
+	fmt.Println(2222)
+}
+
+func main() {
+	testCase0()
+	testCase1()
+}
+
+type DequeueFunc[T any] func(t T, isClose bool) bool
+
+type Queue[T any] interface {
+	Close()
+	Enqueue(T) error
+	Dequeue() (t T, ok bool, isClose bool)
+	DequeueWait() (t T, ok bool, isClose bool)
+	DequeueFunc(fn DequeueFunc[T]) (err error)
+	Count() int64
+	Status() bool
+}
+
+// 自定义错误变量
+var (
+	ErrQueueClosed      = errors.New("queue is closed")
+	ErrQueueClosedEmpty = errors.New("queue is closed and empty")
+)
+
+// NQueue 是一个泛型队列结构体，用于存储任意类型的数据。
+// 它使用链表实现，支持并发安全的入队和出队操作，并且提供了阻塞和非阻塞的出队方式。
+type NQueue[T any] struct {
+	head      *node[T]     // 队列的头节点指针，指向队列的第一个元素。
+	tail      *node[T]     // 队列的尾节点指针，指向队列的最后一个元素。
+	status    bool         // 队列的状态，true 表示队列处于打开状态，false 表示队列已关闭。
+	count     int64        // 队列中元素的数量。
+	recvLock  sync.RWMutex // 读写锁，用于保证并发操作时的线程安全。
+	nodePool  sync.Pool    // 节点对象池，用于复用节点，减少内存分配和垃圾回收的开销。
+	zeroValue T            // 泛型类型的零值，用于在出队时重置节点的值。
+	recvCond  *sync.Cond   // 条件变量，用于在队列为空时阻塞出队操作，直到有新元素入队或队列关闭。
+}
+
+// node 是队列中每个节点的结构体，包含一个泛型类型的值和指向下一个节点的指针。
+type node[T any] struct {
+	value T        // 节点存储的值。
+	next  *node[T] // 指向下一个节点的指针。
+}
+
+// 新建队列，返回一个空队列
+// NewNQueue 函数用于创建一个新的 NQueue 实例，初始化队列的状态、元素数量、条件变量和节点对象池。
+func NewNQueue[T any]() *NQueue[T] {
+	q := &NQueue[T]{}
+	q.status = true                        // 初始化队列状态为打开。
+	q.count = 0                            // 初始化队列元素数量为 0。
+	q.recvCond = sync.NewCond(&q.recvLock) // 创建条件变量，并关联读写锁。
+	q.nodePool = sync.Pool{
+		// 当对象池中没有可用节点时，使用 New 函数创建一个新的节点。
+		New: func() any {
+			return &node[T]{
+				value: q.zeroValue, // 初始化节点的值为泛型类型的零值。
+				next:  nil,         // 初始化节点的下一个节点指针为 nil。
+			}
+		},
+	}
+	return q
+}
+
+// Close 方法用于关闭队列，将队列状态设置为 false，并广播通知所有等待的 goroutine。
+func (q *NQueue[T]) Close() {
+	q.recvLock.Lock()
+	defer q.recvLock.Unlock()
+	q.status = false       // 设置队列状态为关闭。
+	q.recvCond.Broadcast() // 广播通知所有等待的 goroutine，队列状态已改变。
+}
+
+// 插入，将给定的值v放在队列的尾部
+// Enqueue 方法用于将一个值 v 插入到队列的尾部。
+// 如果队列已关闭，返回一个错误。
+func (q *NQueue[T]) Enqueue(v T) error {
+	q.recvLock.Lock()
+	defer q.recvLock.Unlock()
+
+	if !q.status {
+		return ErrQueueClosed // 如果队列已关闭，返回自定义错误
+	}
+
+	n := q.nodePool.Get().(*node[T]) // 从对象池中获取一个节点。
+	n.value = v                      // 设置节点的值为 v。
+	n.next = nil                     // 设置节点的下一个节点指针为 nil。
+
+	if q.head == nil {
+		q.head = n // 如果队列为空，将头节点和尾节点都指向新节点。
+	} else {
+		if q.tail == nil {
+			q.tail = n           // 如果队列只有一个元素，更新尾节点为新节点。
+			q.head.next = q.tail // 将头节点的下一个节点指针指向尾节点。
+		} else {
+			oldTail := q.tail // 保存旧的尾节点。
+			oldTail.next = n  // 将旧尾节点的下一个节点指针指向新节点。
+			q.tail = n        // 更新尾节点为新节点。
+		}
+	}
+
+	q.count++              // 队列元素数量加 1。
+	q.recvCond.Broadcast() // 广播通知所有等待的 goroutine，队列中有新元素入队。
+	return nil
+}
+
+// 不阻塞
+// Dequeue 方法是一个非阻塞的出队方法，调用 dequeue 方法进行出队操作。
+func (q *NQueue[T]) Dequeue() (t T, ok bool, isClose bool) {
+	t, ok, isClose = q.dequeue()
+	return
+}
+
+// 移除，删除并返回队列头部的值,如果队列为空，则返回nil
+// dequeue 方法是一个私有方法，用于执行实际的出队操作。
+// 返回出队的值、是否成功出队的标志和队列是否已关闭的标志。
+func (q *NQueue[T]) dequeue() (t T, ok bool, isClose bool) {
+	q.recvLock.Lock()
+	defer q.recvLock.Unlock()
+	isClose = !q.status // 获取队列是否已关闭的标志。
+	if q.head == nil {
+		t = q.zeroValue // 如果队列为空，返回泛型类型的零值。
+		return
+	} else {
+
+		oldHead := q.head // 保存旧的头节点。
+		if oldHead.next == nil {
+			q.head = nil // 如果队列只有一个元素，将头节点和尾节点都置为 nil。
+		} else {
+			q.head = oldHead.next // 更新头节点为旧头节点的下一个节点。
+			if q.head == q.tail {
+				q.tail = nil // 如果新的头节点是尾节点，将尾节点置为 nil。
+			}
+		}
+
+		ok = true                   // 标记出队成功。
+		q.count--                   // 队列元素数量减 1。
+		t = oldHead.value           // 获取旧头节点的值。
+		oldHead.value = q.zeroValue // 将旧头节点的值重置为泛型类型的零值。
+		oldHead.next = nil          // 将旧头节点的下一个节点指针置为 nil。
+		q.nodePool.Put(oldHead)     // 将旧头节点放回对象池，以便复用。
+
+		return
+	}
+}
+
+// 阻塞    返回值t
+// DequeueWait 方法是一个阻塞的出队方法，会一直等待直到有元素出队或队列关闭。
+// 返回出队的值、是否成功出队的标志和队列是否已关闭的标志。
+func (q *NQueue[T]) DequeueWait() (t T, ok bool, isClose bool) {
+	for {
+		t, ok, isClose = q.dequeue() // 尝试出队。
+		if ok {
+			return // 如果出队成功，返回结果。
+		}
+
+		if isClose {
+			return // 如果队列已关闭，返回结果。
+		}
+
+		q.recvLock.Lock()
+		if q.status && q.count == 0 {
+			q.recvCond.Wait() // 如果队列处于打开状态且为空，阻塞等待。
+		}
+		q.recvLock.Unlock()
+	}
+}
+
+// DequeueFunc 方法是一个阻塞的出队方法，会不断出队元素并调用传入的函数 fn 进行处理。
+// 直到 fn 函数返回 false 或队列关闭且为空。
+// 返回一个错误信息，如果队列关闭且为空，返回相应的错误。
+func (q *NQueue[T]) DequeueFunc(fn DequeueFunc[T]) (err error) {
+	for {
+
+		t, ok, isClose := q.dequeue() // 尝试出队。
+		if ok {
+			if !fn(t, isClose) {
+				return // 如果 fn 函数返回 false，停止出队并返回。
+			}
+		} else if isClose {
+			return ErrQueueClosedEmpty // 返回自定义错误：队列已关闭且为空
+		}
+
+		q.recvLock.Lock()
+
+		if q.status && q.count == 0 {
+			q.recvCond.Wait() // 如果队列处于打开状态且为空，阻塞等待。
+		}
+
+		q.recvLock.Unlock()
+	}
+}
+
+// Count 方法用于获取队列中元素的数量，使用读锁保证并发安全。
+func (q *NQueue[T]) Count() int64 {
+	q.recvLock.RLock()
+	defer q.recvLock.RUnlock()
+	return q.count
+}
+
+// Status 方法用于获取队列的状态，使用读锁保证并发安全。
+func (q *NQueue[T]) Status() bool {
+	q.recvLock.RLock()
+	defer q.recvLock.RUnlock()
+	return q.status
+}
